@@ -543,8 +543,11 @@ class LiveScopeApp:
     def on_trigger_source_change(self, event):
         """เรียกเมื่อผู้ใช้เลือก trigger source ใหม่ (CH1-CH4)"""
         value = self.cb_trig_source.get()
+        ch = value[-1]
         print(f"[Trigger] เลือก source = {value}")
-        self.controller.write(f":TRIGger:EDGE:SOURce {value}")
+        print(f"command :TRIGger:EDGe:SOURce CHANnel{ch}")
+        self.controller.write(f":TRIGger:EDGe:SOURce CHANnel{ch}")
+
 
     def on_trigger_slope_change(self, event):
         """เรียกเมื่อผู้ใช้เลือก trigger slope ใหม่ (Rising/Falling)"""
