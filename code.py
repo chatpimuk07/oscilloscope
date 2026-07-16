@@ -14,12 +14,15 @@ GUI (Tkinter) + Controller (PyVISA) พร้อม Auto-Simulation Mode
    มี "ฟังก์ชันของตัวเอง" ผูกกับ event (command / bind)
    และทุกฟังก์ชันจะ print บอกว่า "ผู้ใช้กด/เลือกอะไร" ออกทาง console
    เพื่อให้ debug และตรวจสอบการทำงานได้ง่าย
+5. เพิ่มกล่อง SCPI Log ด้านล่างของหน้าจอ แสดงคำสั่ง SCPI ทุกคำสั่งที่ถูกส่งออกไป
+   พร้อม timestamp และปุ่ม Clear log
 """
 
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
+from tkinter import scrolledtext
 import pyvisa
 import time
 
@@ -85,6 +88,9 @@ class ScopeController:
         self.output_file = Path(__file__).parent / "live_display.png"
         self.simulation_mode = False
         self.mock_file = Path(__file__).parent / "mock_scope.png"
+        # Callback ที่ GUI จะผูกไว้ เพื่อรับรู้ทุกคำสั่ง SCPI ที่ถูกส่งออกไป (สำหรับ SCPI Log)
+        self.log_callback = None
+        
 
     def connect(self):
         try:
@@ -128,6 +134,13 @@ class ScopeController:
             self.rm = None
 
     def write(self, command):
+        # แจ้งไปยัง GUI (ถ้ามีการผูก callback ไว้) เพื่อบันทึกลง SCPI Log
+        if self.log_callback is not None:
+            try:
+                self.log_callback(command)
+            except Exception as log_err:
+                print(f"[Log Callback Error]: {log_err}")
+
         if self.simulation_mode:
             print(f"[Simulated Write]: {command}")
             return
@@ -194,7 +207,6 @@ class ScopeController:
 def parse_time_to_seconds(text):
     """แปลงข้อความเวลาแบบมีหน่วย เช่น '2.00us' หรือ '2.00µs' -> 2e-6 (วินาที)"""
     text = text.strip()
-    # รองรับทั้งสัญลักษณ์ µ (micro sign) และ μ (greek mu) รวมถึง 'us' แบบเดิม
     units = {
         "ps": 1e-12,
         "ns": 1e-9,
@@ -202,7 +214,6 @@ def parse_time_to_seconds(text):
         "ms": 1e-3,
         "s": 1.0,
     }
-    # ต้องเช็คหน่วยที่ยาวกว่าก่อน เพื่อไม่ให้ 's' ไปแมตช์ผิดตัว (เช่น 'ms' ลงท้ายด้วย 's' เช่นกัน)
     for unit in ("ps", "ns", "µs", "μs", "us", "ms", "s"):
         if text.endswith(unit):
             number_part = text[: -len(unit)]
@@ -241,10 +252,12 @@ class LiveScopeApp:
         self.root = root
         self.root.title("RIGOL Control Panel (Interactive GUI)")
         self.root.configure(bg="#f5f5f5")
-        self.root.minsize(900, 620)  # ปรับ UI: กันหน้าต่างเล็กเกินไปจนบีบ layout
+        self.root.minsize(950, 700)  # ขยาย minsize ให้สูงขึ้นเพื่อรองรับกล่อง SCPI Log
 
         self.controller = ScopeController()
         self.is_streaming = False
+
+    
 
         # เก็บ widget ของแต่ละ channel ไว้ใช้อ้างอิงภายหลัง (ch -> dict ของ widgets)
         self.channel_widgets = {}
@@ -253,7 +266,7 @@ class LiveScopeApp:
         style.theme_use('clam')
 
         # -------------------------------------------------------------
-        # [1] TOP FRAME - แถวด้านบนสุด (Info, Horizontal, Trigger)
+        # [1] TOP FRAME - แถวด้านบนสุด (Info, Horizontal, Trigger, SCPI)
         # -------------------------------------------------------------
         top_frame = tk.Frame(root, bg="#f5f5f5")
         top_frame.pack(side="top", fill="x", padx=15, pady=(15, 5))
@@ -272,11 +285,9 @@ class LiveScopeApp:
 
         btn_run_stop_frame = tk.Frame(info_area, bg="#f5f5f5")
         btn_run_stop_frame.pack(anchor="w")
-        # ปุ่ม RUN -> ผูกกับ self.click_run
         self.btn_run = tk.Button(btn_run_stop_frame, text="▶ RUN", font=("Arial", 8),
                                   width=8, command=self.click_run)
         self.btn_run.pack(side="left", padx=(0, 5))
-        # ปุ่ม STOP -> ผูกกับ self.click_stop
         self.btn_stop = tk.Button(btn_run_stop_frame, text="⏸ STOP", font=("Arial", 8),
                                    width=8, command=self.click_stop)
         self.btn_stop.pack(side="left")
@@ -286,19 +297,17 @@ class LiveScopeApp:
                                   bg="#f5f5f5", padx=10, pady=5)
         horiz_lf.pack(side="left", anchor="n", padx=10)
 
-        # time/div -> เมื่อเลือกค่าใหม่ จะเรียก self.on_timebase_change (ครบย่าน 5ns - 500s ลำดับ 1-2-5)
         self.cb_timebase = self.create_dropdown_row(
             horiz_lf, "time/div", TIME_DIV_VALUES,
             width=10, on_select=self.on_timebase_change
         )
-        # horizontal offset -> เปลี่ยนเป็น Spinbox, เมื่อเปลี่ยนค่า จะเรียก self.on_horizontal_offset_change
         self.sb_h_offset = self.create_spinbox_row(
             horiz_lf, "offset", H_OFFSET_VALUES,
             width=10, on_change=self.on_horizontal_offset_change,
             initial_value="0.00s"
         )
 
-        # 1.3 โซนขวาของด้านบน: Trigger
+        # 1.3 โซนขวากลาง: Trigger
         trigger_lf = tk.LabelFrame(top_frame, text="Trigger", font=("Arial", 9, "bold"),
                                     bg="#f5f5f5", padx=10, pady=5)
         trigger_lf.pack(side="left", anchor="n", padx=10)
@@ -312,7 +321,6 @@ class LiveScopeApp:
         self.cb_trig_source = ttk.Combobox(grid_trig, values=["CH1", "CH2", "CH3", "CH4"], width=8)
         self.cb_trig_source.current(0)
         self.cb_trig_source.grid(row=0, column=1, padx=5, pady=2)
-        # เมื่อเลือก source ใหม่ -> self.on_trigger_source_change
         self.cb_trig_source.bind("<<ComboboxSelected>>", self.on_trigger_source_change)
 
         # --- slope ---
@@ -321,16 +329,14 @@ class LiveScopeApp:
         self.cb_trig_slope = ttk.Combobox(grid_trig, values=["Rising", "Falling"], width=8)
         self.cb_trig_slope.current(0)
         self.cb_trig_slope.grid(row=1, column=1, padx=5, pady=2)
-        # เมื่อเลือก slope ใหม่ -> self.on_trigger_slope_change
         self.cb_trig_slope.bind("<<ComboboxSelected>>", self.on_trigger_slope_change)
 
-        # --- level (Entry) ---
+        # --- level ---
         tk.Label(grid_trig, text="level", bg="#f5f5f5", anchor="w").grid(
             row=0, column=2, padx=5, pady=2, sticky="w")
         self.entry_trig_level = ttk.Entry(grid_trig, width=10)
         self.entry_trig_level.insert(0, "0.00V")
         self.entry_trig_level.grid(row=0, column=3, padx=5, pady=2)
-        # กด Enter หรือคลิกออกจากช่อง -> self.on_trigger_level_change
         self.entry_trig_level.bind("<Return>", self.on_trigger_level_change)
         self.entry_trig_level.bind("<FocusOut>", self.on_trigger_level_change)
 
@@ -340,8 +346,20 @@ class LiveScopeApp:
         self.cb_trig_sweep = ttk.Combobox(grid_trig, values=["Auto", "Normal", "Single"], width=8)
         self.cb_trig_sweep.current(0)
         self.cb_trig_sweep.grid(row=1, column=3, padx=5, pady=2)
-        # เมื่อเลือก sweep ใหม่ -> self.on_trigger_sweep_change
         self.cb_trig_sweep.bind("<<ComboboxSelected>>", self.on_trigger_sweep_change)
+
+        # 1.4 โซนขวาสุดของด้านบน: SCPI Command Box (แก้ไขจุดนี้ให้สมบูรณ์)
+        scpi_lf = tk.LabelFrame(top_frame, text="SCPI", font=("Arial", 9, "bold"),
+                                bg="#f5f5f5", padx=10, pady=5)
+        scpi_lf.pack(side="right", anchor="n", padx=10, pady=5)
+
+        # ปรับตัวแปรเป็น self.scpi_box เพื่อให้เรียกใช้จากเมธอดอื่นได้
+        self.scpi_box = tk.Entry(scpi_lf, width=40)
+        self.scpi_box.pack(side="left", padx=5, pady=5)
+        self.scpi_box.bind("<Return>", self.send_command) # กด Enter เพื่อส่งคำสั่งได้
+
+        submit_btn = tk.Button(scpi_lf, text="Submit", command=self.send_command, bg="#e0e0e0")
+        submit_btn.pack(side="left", padx=5, pady=5)
 
         # -------------------------------------------------------------
         # [2] MIDDLE & LOWER SECTION
@@ -349,7 +367,6 @@ class LiveScopeApp:
         main_frame = tk.Frame(root, bg="#f5f5f5")
         main_frame.pack(side="top", fill="both", expand=True, padx=15, pady=5)
 
-        # 2.1 ฝั่งซ้าย: หน้าจอแสดงผล + ปุ่ม capture
         left_column = tk.Frame(main_frame, bg="#f5f5f5")
         left_column.pack(side="left", fill="both", expand=True)
 
@@ -363,21 +380,41 @@ class LiveScopeApp:
 
         bottom_left_bar = tk.Frame(left_column, bg="#f5f5f5")
         bottom_left_bar.pack(side="top", fill="x", pady=(10, 0))
-        # ปุ่ม capture -> ผูกกับ self.capture
         self.btn_capture = tk.Button(bottom_left_bar, text="capture", width=15, command=self.capture)
         self.btn_capture.pack(side="left")
-        # ป้ายบอกผลการ capture ล่าสุด (ปรับ UI เพิ่มเติม)
         self.capture_status_label = tk.Label(bottom_left_bar, text="", bg="#f5f5f5", font=("Arial", 8))
         self.capture_status_label.pack(side="left", padx=10)
 
-        # 2.2 ฝั่งขวา: แผงช่องสัญญาณ CH1 - CH4
         right_column = tk.Frame(main_frame, bg="#f5f5f5")
         right_column.pack(side="right", fill="y", padx=(20, 0), anchor="n")
 
-        self.create_channel_box(right_column, 1, "#e6c300", fg_text="#b38f00")
-        self.create_channel_box(right_column, 2, "#0099ff")
+        self.create_channel_box(right_column, 1, "#e6c300", fg_text="#ffcc00")
+        self.create_channel_box(right_column, 2, "#00d5ff")
         self.create_channel_box(right_column, 3, "#ff33aa")
-        self.create_channel_box(right_column, 4, "#00bb44")
+        self.create_channel_box(right_column, 4, "#0092d6")
+
+        # -------------------------------------------------------------
+        # [2.5] SCPI LOG - กล่องแสดง log คำสั่ง SCPI ทุกคำสั่งที่ถูกส่งออกไป
+        # -------------------------------------------------------------
+        log_lf = tk.LabelFrame(root, text="SCPI Log", font=("Arial", 9, "bold"),
+                                bg="#f5f5f5", padx=10, pady=5)
+        log_lf.pack(side="top", fill="both", padx=15, pady=(5, 0))
+
+        log_toolbar = tk.Frame(log_lf, bg="#f5f5f5")
+        log_toolbar.pack(side="top", fill="x")
+        self.btn_clear_log = tk.Button(log_toolbar, text="Clear log", font=("Arial", 8),
+                                        command=self.clear_scpi_log)
+        self.btn_clear_log.pack(side="right")
+
+        self.scpi_log = scrolledtext.ScrolledText(
+            log_lf, height=8, font=("Consolas", 9),
+            bg="#1e1e1e", fg="#00ff66", insertbackground="#00ff66",
+            wrap="none", state="disabled"
+        )
+        self.scpi_log.pack(side="top", fill="both", expand=True, pady=(5, 0))
+
+        # ผูก callback ของ controller ให้เรียก log_scpi ทุกครั้งที่มีการ write คำสั่งออกไป
+        self.controller.log_callback = self.log_scpi
 
         # -------------------------------------------------------------
         # [3] BOTTOM BAR
@@ -385,7 +422,6 @@ class LiveScopeApp:
         bottom_bar = tk.Frame(root, bg="#f5f5f5")
         bottom_bar.pack(side="bottom", fill="x", padx=15, pady=15)
 
-        # ปุ่ม close -> ผูกกับ self.close_app
         self.btn_exit = tk.Button(bottom_bar, text="close", width=15, bg="#ff4d4d", fg="black",
                                    command=self.close_app)
         self.btn_exit.pack(side="right")
@@ -393,10 +429,49 @@ class LiveScopeApp:
         self.init_connection()
 
     # -------------------------------------------------------------
+    # CALLBACK: SCPI Log
+    # -------------------------------------------------------------
+    def log_scpi(self, command):
+        """เพิ่มบรรทัดคำสั่ง SCPI ลงในกล่อง log พร้อม timestamp และเลื่อนไปบรรทัดล่างสุดอัตโนมัติ"""
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{timestamp}] {command}\n"
+
+        self.scpi_log.config(state="normal")
+        self.scpi_log.insert("end", line)
+
+        # จำกัดจำนวนบรรทัดไม่ให้เยอะเกินไป (เก็บไว้ล่าสุด 500 บรรทัด)
+        line_count = int(self.scpi_log.index("end-1c").split(".")[0])
+        max_lines = 500
+        if line_count > max_lines:
+            self.scpi_log.delete("1.0", f"{line_count - max_lines}.0")
+
+        self.scpi_log.see("end")
+        self.scpi_log.config(state="disabled")
+
+    def clear_scpi_log(self):
+        print("[Button] กด Clear log")
+        self.scpi_log.config(state="normal")
+        self.scpi_log.delete("1.0", "end")
+        self.scpi_log.config(state="disabled")
+
+    # -------------------------------------------------------------
+    # CALLBACK: SCPI Command Sender (แก้ไขย้ายมาเป็น Method ของ Class)
+    # -------------------------------------------------------------
+    def send_command(self, event=None):
+        """รับคำสั่งจากช่องพิมพ์แล้วส่งไปยังตัวควบคุมผ่าน SCPI รองรับทั้งการคลิกปุ่มและกด Enter"""
+        command = self.scpi_box.get().strip()
+        if command:
+            print(f"[SCPI Box] command : {command}")
+            try:
+                self.controller.write(command)
+                self.scpi_box.delete(0, tk.END) # ล้างช่องพิมพ์เมื่อส่งเสร็จ
+            except Exception as e:
+                print(f"Error sending SCPI via text box: {e}")
+
+    # -------------------------------------------------------------
     # ฟังก์ชันช่วยสร้าง Layout (Helper Functions)
     # -------------------------------------------------------------
     def create_dropdown_row(self, parent, label_text, values, width=8, on_select=None):
-        """สร้างแถว Label + Combobox แล้วผูก event <<ComboboxSelected>> เข้ากับ on_select"""
         row = tk.Frame(parent, bg="#f5f5f5")
         row.pack(fill="x", pady=2)
         lbl = tk.Label(row, text=label_text, width=8, bg="#f5f5f5", anchor="w")
@@ -410,8 +485,6 @@ class LiveScopeApp:
         return cb
 
     def create_spinbox_row(self, parent, label_text, values, width=8, on_change=None, initial_value=None):
-        """สร้างแถว Label + Spinbox (ไล่ค่าจากลิสต์ values ด้วยลูกศรขึ้น/ลง หรือพิมพ์เองก็ได้)
-        แล้วผูก event การเปลี่ยนค่าเข้ากับ on_change (เรียกตอนกดลูกศร / Enter / คลิกออกจากช่อง)"""
         row = tk.Frame(parent, bg="#f5f5f5")
         row.pack(fill="x", pady=2)
         lbl = tk.Label(row, text=label_text, width=8, bg="#f5f5f5", anchor="w")
@@ -421,19 +494,16 @@ class LiveScopeApp:
                          command=lambda: on_change(None) if on_change else None)
         sb.pack(side="right", padx=5)
 
-        # ตั้งค่าเริ่มต้น
         start_value = initial_value if initial_value in values else (values[0] if values else "")
         sb.delete(0, "end")
         sb.insert(0, start_value)
 
         if on_change is not None:
-            # เรียกเมื่อพิมพ์ค่าเองแล้วกด Enter หรือคลิกออกจากช่อง
             sb.bind("<Return>", on_change)
             sb.bind("<FocusOut>", on_change)
         return sb
 
     def create_channel_box(self, parent, ch, border_color, fg_text=None):
-        """สร้างบล็อกควบคุมของแต่ละ channel (CH1-CH4) พร้อมผูกฟังก์ชันให้ทุก widget"""
         text_color = fg_text if fg_text else border_color
         lf = tk.LabelFrame(
             parent, text=f"CH {ch}", font=("Arial", 9, "bold"),
@@ -441,7 +511,6 @@ class LiveScopeApp:
         )
         lf.pack(fill="x", pady=5)
 
-        # --- display checkbox -> self.on_channel_display_toggle ---
         chk_var = tk.BooleanVar(value=True)
         chk = tk.Checkbutton(
             lf, text="display", variable=chk_var, bg="#f5f5f5",
@@ -450,25 +519,21 @@ class LiveScopeApp:
         )
         chk.pack(anchor="w")
 
-        # --- V/div -> self.on_channel_vdiv_change (ครบย่าน 500µV - 10V ลำดับ 1-2-5) ---
         cb_vdiv = self.create_channel_control_row(
             lf, "V/div", VOLT_DIV_VALUES,
             on_select=lambda e, ch=ch: self.on_channel_vdiv_change(ch, e.widget.get())
         )
 
-        # --- offset -> เปลี่ยนเป็น Spinbox -> self.on_channel_offset_change ---
         sb_offset = self.create_channel_offset_spinbox_row(
             lf, "offset", CH_OFFSET_VALUES, ch=ch,
             initial_value="0.00V"
         )
 
-        # --- coupling -> self.on_channel_coupling_change ---
         cb_coupling = self.create_channel_control_row(
             lf, "coupling", ["DC", "AC", "GND"],
             on_select=lambda e, ch=ch: self.on_channel_coupling_change(ch, e.widget.get())
         )
 
-        # เก็บ widget ของ channel นี้ไว้ใช้อ้างอิงภายหลัง (ถ้าต้องการ)
         self.channel_widgets[ch] = {
             "display_var": chk_var,
             "vdiv": cb_vdiv,
@@ -477,7 +542,6 @@ class LiveScopeApp:
         }
 
     def create_channel_control_row(self, parent, label_text, values, on_select=None):
-        """จัดหน้าย่อยปุ่มควบคุม (Label + Combobox) และผูก event ให้ on_select"""
         row = tk.Frame(parent, bg="#f5f5f5")
         row.pack(fill="x", pady=1)
         lbl = tk.Label(row, text=label_text, width=6, bg="#f5f5f5", font=("Arial", 8), anchor="w")
@@ -491,8 +555,6 @@ class LiveScopeApp:
         return cb
 
     def create_channel_offset_spinbox_row(self, parent, label_text, values, ch, initial_value=None):
-        """จัดหน้าย่อยปุ่มควบคุม offset ของ channel เป็น Spinbox (แทน Combobox เดิม)
-        ผูก event เข้ากับ self.on_channel_offset_change ของ channel นั้น ๆ"""
         row = tk.Frame(parent, bg="#f5f5f5")
         row.pack(fill="x", pady=1)
         lbl = tk.Label(row, text=label_text, width=6, bg="#f5f5f5", font=("Arial", 8), anchor="w")
@@ -518,7 +580,6 @@ class LiveScopeApp:
     # CALLBACK: Horizontal
     # -------------------------------------------------------------
     def on_timebase_change(self, event):
-        """เรียกเมื่อผู้ใช้เลือกค่า time/div ใหม่ จาก Combobox"""
         value = self.cb_timebase.get()
         print(f"[Horizontal] เลือก time/div = {value}")
         seconds = parse_time_to_seconds(value)
@@ -528,7 +589,6 @@ class LiveScopeApp:
             print(f"  -> แปลงค่า '{value}' ไม่สำเร็จ")
 
     def on_horizontal_offset_change(self, event):
-        """เรียกเมื่อผู้ใช้เปลี่ยนค่า horizontal offset ใหม่ จาก Spinbox (ลูกศร / พิมพ์เอง)"""
         value = self.sb_h_offset.get()
         print(f"[Horizontal] เลือก offset = {value}")
         seconds = parse_time_to_seconds(value)
@@ -541,23 +601,19 @@ class LiveScopeApp:
     # CALLBACK: Trigger
     # -------------------------------------------------------------
     def on_trigger_source_change(self, event):
-        """เรียกเมื่อผู้ใช้เลือก trigger source ใหม่ (CH1-CH4)"""
         value = self.cb_trig_source.get()
         ch = value[-1]
         print(f"[Trigger] เลือก source = {value}")
         print(f"command :TRIGger:EDGe:SOURce CHANnel{ch}")
         self.controller.write(f":TRIGger:EDGe:SOURce CHANnel{ch}")
 
-
     def on_trigger_slope_change(self, event):
-        """เรียกเมื่อผู้ใช้เลือก trigger slope ใหม่ (Rising/Falling)"""
         value = self.cb_trig_slope.get()
         print(f"[Trigger] เลือก slope = {value}")
         scpi_value = "POSitive" if value == "Rising" else "NEGative"
         self.controller.write(f":TRIGger:EDGE:SLOPe {scpi_value}")
 
     def on_trigger_level_change(self, event):
-        """เรียกเมื่อผู้ใช้พิมพ์ trigger level แล้วกด Enter หรือคลิกออกจากช่อง"""
         value = self.entry_trig_level.get()
         print(f"[Trigger] ตั้งค่า level = {value}")
         volts = parse_voltage_to_volts(value)
@@ -567,7 +623,6 @@ class LiveScopeApp:
             print(f"  -> แปลงค่า '{value}' ไม่สำเร็จ (รูปแบบต้องเป็นเช่น 1.20V หรือ 500.00mV)")
 
     def on_trigger_sweep_change(self, event):
-        """เรียกเมื่อผู้ใช้เลือก trigger sweep mode ใหม่ (Auto/Normal/Single)"""
         value = self.cb_trig_sweep.get()
         print(f"[Trigger] เลือก sweep = {value}")
         scpi_value = {"Auto": "AUTO", "Normal": "NORMal", "Single": "SINGle"}.get(value, "AUTO")
@@ -577,13 +632,11 @@ class LiveScopeApp:
     # CALLBACK: Channel (CH1-CH4)
     # -------------------------------------------------------------
     def on_channel_display_toggle(self, ch, var):
-        """เรียกเมื่อผู้ใช้ติ๊ก/ยกเลิกติ๊ก checkbox 'display' ของ channel นั้น ๆ"""
         is_on = var.get()
         print(f"[CH{ch}] display = {'ON' if is_on else 'OFF'}")
         self.controller.write(f":CHANnel{ch}:DISPlay {'ON' if is_on else 'OFF'}")
 
     def on_channel_vdiv_change(self, ch, value):
-        """เรียกเมื่อผู้ใช้เลือกค่า V/div ใหม่ของ channel นั้น ๆ"""
         print(f"[CH{ch}] เลือก V/div = {value}")
         volts = parse_voltage_to_volts(value)
         if volts is not None:
@@ -592,7 +645,6 @@ class LiveScopeApp:
             print(f"  -> แปลงค่า '{value}' ไม่สำเร็จ")
 
     def on_channel_offset_change(self, ch, value):
-        """เรียกเมื่อผู้ใช้เปลี่ยนค่า offset ใหม่ของ channel นั้น ๆ จาก Spinbox"""
         print(f"[CH{ch}] เลือก offset = {value}")
         volts = parse_voltage_to_volts(value)
         if volts is not None:
@@ -601,7 +653,6 @@ class LiveScopeApp:
             print(f"  -> แปลงค่า '{value}' ไม่สำเร็จ")
 
     def on_channel_coupling_change(self, ch, value):
-        """เรียกเมื่อผู้ใช้เลือก coupling ใหม่ของ channel นั้น ๆ (DC/AC/GND)"""
         print(f"[CH{ch}] เลือก coupling = {value}")
         self.controller.write(f":CHANnel{ch}:COUPling {value}")
 
@@ -609,27 +660,24 @@ class LiveScopeApp:
     # CALLBACK: ปุ่มหลัก (RUN / STOP / capture / close)
     # -------------------------------------------------------------
     def click_run(self):
-        """เรียกเมื่อกดปุ่ม RUN"""
         print("[Button] กด RUN")
         try:
             self.controller.run()
             self.stat.set("Status : Run")
-            self.status_label.config(fg="#0a8a0a")  # เขียว = กำลังรัน
+            self.status_label.config(fg="#0a8a0a")
         except Exception as e:
             print(f"Command Error: {e}")
 
     def click_stop(self):
-        """เรียกเมื่อกดปุ่ม STOP"""
         print("[Button] กด STOP")
         try:
             self.controller.stop()
             self.stat.set("Status : Stop")
-            self.status_label.config(fg="#cc0000")  # แดง = หยุดอยู่
+            self.status_label.config(fg="#cc0000")
         except Exception as e:
             print(f"Command Error: {e}")
 
     def capture(self):
-        """เรียกเมื่อกดปุ่ม capture (บันทึกภาพหน้าจอปัจจุบันเป็นไฟล์)"""
         print("[Button] กด capture")
         try:
             img_path = self.controller.capture_live_image()
@@ -643,7 +691,6 @@ class LiveScopeApp:
             self.capture_status_label.config(text=f"Error: {e}")
 
     def close_app(self):
-        """เรียกเมื่อกดปุ่ม close (ปิดโปรแกรมและตัดการเชื่อมต่อ)"""
         print("[Button] กด close -> กำลังปิดระบบและเคลียร์พอร์ตเชื่อมต่อ...")
         self.is_streaming = False
         self.controller.disconnect()
@@ -661,7 +708,19 @@ class LiveScopeApp:
                 self.info_label.config(text=f"Connected:\n{idn[:30]}...")
             except Exception:
                 self.info_label.config(text="Connected:\nRIGOL Device")
-
+            try:
+                self.controller.write(":RUN")
+                self.controller.write(":CHANnel1:DISPlay ON")
+                self.controller.write(":CHANnel2:DISPlay ON")
+                self.controller.write(":CHANnel3:DISPlay ON")
+                self.controller.write(":CHANnel4:DISPlay ON")
+                self.controller.write(":CHANnel1:OFFSet 0")
+                self.controller.write(":CHANnel2:OFFSet 0")
+                self.controller.write(":CHANnel3:OFFSet 0")
+                self.controller.write(":CHANnel4:OFFSet 0")
+                self.controller.write(":TRIGger:EDGe:SOURce CHANnel1")
+            except Exception as e:
+                print(f"Initial setup command error: {e}")
             self.is_streaming = True
             self.update_loop()
         except Exception as e:
@@ -685,6 +744,7 @@ class LiveScopeApp:
             self.controller.write(command)
         except Exception as e:
             print(f"error: {e}")
+    
 
 
 if __name__ == "__main__":
